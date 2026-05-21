@@ -1,0 +1,78 @@
+{
+  "vault_path": {
+    "description": "Obsidian 笔记库路径（任务功能总开关）",
+    "hint": "留空则关闭全部任务扫描与推送功能",
+    "type": "string"
+  },
+  "morning_push_time": {
+    "description": "早间任务推送",
+    "hint": "留空则不推送。格式 HH:MM，如 08:30",
+    "type": "string"
+  },
+  "noon_push_time": {
+    "description": "午间任务推送",
+    "hint": "留空则不推送。格式 HH:MM，如 13:00",
+    "type": "string"
+  },
+  "night_push_time": {
+    "description": "晚间任务推送",
+    "hint": "留空则不推送。格式 HH:MM，如 20:00",
+    "type": "string"
+  },
+  "review_day": {
+    "description": "周复盘日",
+    "hint": "需同时设置时间。mon/tue/wed/thu/fri/sat/sun",
+    "type": "string"
+  },
+  "review_time": {
+    "description": "周复盘时间",
+    "hint": "需同时设置复盘日。格式 HH:MM，如 22:00",
+    "type": "string"
+  },
+  "news_enabled": {
+    "description": "启用新闻推送",
+    "type": "bool",
+    "default": false
+  },
+  "morning_news_time": {
+    "description": "早间新闻推送",
+    "hint": "需先开启新闻推送开关。格式 HH:MM",
+    "type": "string"
+  },
+  "night_news_time": {
+    "description": "晚间新闻推送",
+    "hint": "需先开启新闻推送开关。格式 HH:MM",
+    "type": "string"
+  },
+  "news_sources": {
+    "description": "RSS 新闻源",
+    "type": "template_list",
+    "templates": {
+      "rss_source": {
+        "name": "RSS 新闻源",
+        "hint": "添加一个 RSS 新闻源",
+        "items": {
+          "name": {
+            "description": "来源名称",
+            "type": "string",
+            "default": ""
+          },
+          "url": {
+            "description": "RSS 地址",
+            "type": "string",
+            "default": ""
+          }
+        }
+      }
+    },
+    "default": [
+      {"__template_key": "rss_source", "name": "FT中文", "url": "http://www.ftchinese.com/rss/feed"},
+      {"__template_key": "rss_source", "name": "WSJ中文", "url": "https://cn.wsj.com/zh-hans/rss"},
+      {"__template_key": "rss_source", "name": "联合早报", "url": "https://rsshub.app/zaobao/realtime/china"},
+      {"__template_key": "rss_source", "name": "财新网", "url": "https://rsshub.rssforever.com/caixin/latest"},
+      {"__template_key": "rss_source", "name": "华尔街见闻", "url": "https://rsshub.rssforever.com/wallstreetcn/news"},
+      {"__template_key": "rss_source", "name": "Solidot", "url": "https://www.solidot.org/index.rss"},
+      {"__template_key": "rss_source", "name": "BBC", "url": "https://feeds.bbci.co.uk/news/rss.xml"}
+    ]
+  }
+}

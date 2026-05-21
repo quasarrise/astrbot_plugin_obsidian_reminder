@@ -1,0 +1,5 @@
+name: obsidian_reminder
+display_name: Obsidian Remainder
+desc: 扫描 Obsidian 笔记库中的待办任务，按优先级定时推送提醒；集成多源 RSS 新闻简报，由 AI 精选后推送。
+version: v1.0.0
+author: quasarrise
