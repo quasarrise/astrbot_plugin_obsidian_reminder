@@ -1,31 +1,49 @@
 import os, re, json, logging, random, asyncio, feedparser, requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from apscheduler.schedulers.asyncio import AsyncIOScheduler 
 from astrbot.api.event import filter, MessageChain, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+
+# --- 内置默认 LLM 提示词模板（WebUI 未配置时使用；{materials}/{context} 为占位符） ---
+DEFAULT_NEWS_PROMPT = (
+    "你是一位冷静、高效的资深编辑。以下是过去 12 小时的全球情报素材（含英文）：\n"
+    "{materials}\n\n"
+    "请完成：\n"
+    "- 语义去重与新闻整合：合并不同来源对同一大事的报道，英文内容请直接翻译要点。（这部分无须直接反馈给我）\n"
+    "- 要闻精选与内容提炼：基于这些报道，选出 5 条对中国市场、全球政治或全球科技有重大影响的消息，"
+    "每条新闻用一句话补充其要点并说明它为何重要（不超过100字），注明新闻来源。"
+)
+
+DEFAULT_REVIEW_PROMPT = (
+    "你是一个专业的合作伙伴和靠谱的朋友。请分析以下本周未完成的任务：\n"
+    "{context}\n"
+    "请以你的人格设定，结合项目名和标签，给出一个简短的进度压力分析和下周建议。不要列清单，直接给结论。限 100 字。"
+)
+
+
+def _render_template(template: str, **kwargs):
+    """将模板中的 {key} 占位符替换为实际内容。用 replace 而非 format，避免用户模板里出现多余大括号时抛异常。"""
+    for k, v in kwargs.items():
+        template = template.replace("{" + k + "}", v)
+    return template
+
 
 class NewsScout:
-    def __init__(self, sources: dict = None):
-        if sources:
-            self.sources = sources
-        else:
-            self.sources = {
-                "FT中文": "http://www.ftchinese.com/rss/feed",
-                "WSJ中文": "https://cn.wsj.com/zh-hans/rss",
-                "联合早报": "https://rsshub.app/zaobao/realtime/china",
-                "财新网": "https://rsshub.rssforever.com/caixin/latest",
-                "华尔街见闻": "https://rsshub.rssforever.com/wallstreetcn/news",
-                "Solidot": "https://www.solidot.org/index.rss",
-                "BBC": "https://feeds.bbci.co.uk/news/rss.xml"
-            }
-    async def get_curated_report(self, context, provider_id):
-        raw_data = []
+    """RSS 新闻抓取与处理（支持 LLM 提炼和原文整理两种模式）"""
+
+    FETCH_LIMIT = 8  # 每个源最多取多少条
+
+    @staticmethod
+    async def fetch_sources(sources: dict) -> list:
+        """抓取多个 RSS 源，返回标准化条目列表"""
         import socket
         socket.setdefaulttimeout(10)
-
-        for name, url in self.sources.items():
+        entries = []
+        for name, url in sources.items():
             try:
-                logging.info(f"[NewsScout] 正在尝试解析: {name}...")
+                logging.info(f"[NewsScout] 正在抓取: {name}...")
                 headers = {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                 }
@@ -33,38 +51,74 @@ class NewsScout:
                     resp = requests.get(url, headers=headers, timeout=12)
                     resp.raise_for_status()
                     feed = feedparser.parse(resp.text)
-                except Exception as proxy_err:
-                    logging.warning(f"⚠️ 抓取 {name} 失败，尝试直连... ")
+                except Exception:
                     feed = feedparser.parse(url)
 
                 if feed.entries:
                     count = 0
-                    for entry in feed.entries[:10]:
+                    for entry in feed.entries[:NewsScout.FETCH_LIMIT]:
                         content_raw = entry.get('summary', entry.get('description', ''))
-                        summary = re.sub(r'<[^>]+>', '', content_raw)[:80]
-                        raw_data.append(f"[{name}] {entry.title}: {summary.strip()}")
+                        desc = re.sub(r'<[^>]+>', '', content_raw)[:80]
+                        link = entry.get('link', '')
+                        entries.append({
+                            'source': name,
+                            'title': entry.title.strip(),
+                            'desc': desc.strip(),
+                            'link': link.strip(),
+                        })
                         count += 1
-                    logging.info(f"✅ {name} 成功获取 {count} 条资讯")
+                    logging.info(f"✅ {name} → {count} 条")
                 else:
-                    logging.warning(f"⚠️ {name} 所有尝试均未获取到内容")
-
+                    logging.warning(f"⚠️ {name} 无内容")
             except Exception as e:
-                logging.error(f"❌ {name} 过程异常: {e}")
-                continue
+                logging.error(f"❌ {name} 异常: {e}")
+        return entries
 
-        if not raw_data: 
-            return "暂时没有抓取到新资讯。可能是源站网络波动，建议稍后再试 (face14)"
+    @staticmethod
+    async def llm_report(entries: list, context, provider_id: str, prompt_template: str | None = None) -> str | None:
+        """LLM 提炼：去重 + 精选 + 要闻摘要"""
+        raw_lines = []
+        for e in entries:
+            raw_lines.append(f"[{e['source']}] {e['title']}: {e['desc']}")
+        if not raw_lines:
+            return None
 
-        prompt = (
-            "你是一位冷静、高效的资深编辑。以下是过去 12 小时的全球情报素材（含英文）：\n"
-            f"{chr(10).join(raw_data)}\n\n"
-            "请完成：\n"
-            "- 语义去重与新闻整合：合并不同来源对同一大事的报道，英文内容请直接翻译要点。（这部分无须直接反馈给我）\n"
-            "- 要闻精选与内容提炼：基于这些报道，选出 5 条对中国市场、全球政治或全球科技有重大影响的消息，每条新闻用一句话补充其要点并说明它为何重要（不超过100字），注明新闻来源。"
-        )
-
+        tmpl = prompt_template or DEFAULT_NEWS_PROMPT
+        prompt = _render_template(tmpl, materials=chr(10).join(raw_lines))
         resp = await context.llm_generate(chat_provider_id=provider_id, prompt=prompt)
-        return resp.completion_text if resp else "提炼失败。"
+        return resp.completion_text if resp else None
+
+    @staticmethod
+    def raw_report(entries: list, group_name: str) -> str | None:
+        """原文链接模式：脚本整理标题+链接，零 LLM 开销"""
+        if not entries:
+            return None
+
+        lines = [f"📰 {group_name}", "─" * 12, ""]
+        current_source = None
+        for e in entries:
+            if e['source'] != current_source:
+                current_source = e['source']
+                lines.append(f"▎{current_source}")
+            link_part = f" {e['link']}" if e['link'] else ""
+            lines.append(f"  · {e['title']}{link_part}")
+        
+        return "\n".join(lines)
+
+    @staticmethod
+    async def process_group(name: str, sources: dict, mode: str, context, provider_id: str | None = None, prompt_template: str | None = None) -> str | None:
+        """处理一个新闻分组，返回格式化报告"""
+        entries = await NewsScout.fetch_sources(sources)
+        if not entries:
+            return None
+
+        if mode == "llm":
+            if not provider_id:
+                logging.warning(f"[NewsScout] 分组「{name}」为 llm 模式但无 provider_id")
+                return None
+            return await NewsScout.llm_report(entries, context, provider_id, prompt_template)
+        else:
+            return NewsScout.raw_report(entries, name)
 
 
 def _parse_time(time_str: str):
@@ -75,7 +129,246 @@ def _parse_time(time_str: str):
     except Exception:
         return 0, 0
 
-@register("obsidian_reminder", "quasarrise", "扫描 Obsidian 待办并定时推送提醒，集成 RSS 新闻简报", "1.0.0")
+
+class ChineseDateParser:
+    """从中文自然语言中解析日期和任务文本。
+
+    先尝试在开头找日期，找不到再在结尾找。
+    日期和内容之间可无间隔、空格、中英文逗号。
+    内容段原样保留（含时间、标签、其他日期文字）。
+
+    支持格式:
+      - 2026年6月23日买菜 / 买菜2026年6月23日
+      - 2026-07-04干活 / 干活2026-07-04
+      - 今天修手表 / 修手表今天
+      - 明天开发票 / 开发票明天
+      - 下周二看病 / 看病下周二
+      - 7月4日交稿 / 交稿7月4日
+      - 25号交稿 / 交稿25号
+      等等
+    """
+    _SEP = ' ，,、\t'
+
+    WEEKDAY_NAMES = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+
+    @classmethod
+    def parse(cls, text: str):
+        """解析文本，返回 (datetime.date or None, task_text)。"""
+        from datetime import date
+        today = date.today()
+        text = text.strip()
+        if not text:
+            return None, ""
+
+        # Pass 1：在开头找日期
+        for name in cls._BEGIN_HANDLER_NAMES:
+            handler = getattr(cls, name)
+            result = handler(text, today)
+            if result is not None:
+                dt, content = result
+                return dt, content.lstrip(cls._SEP).strip()
+
+        # Pass 2：在结尾找日期
+        for name in cls._END_HANDLER_NAMES:
+            handler = getattr(cls, name)
+            result = handler(text, today)
+            if result is not None:
+                dt, content = result
+                return dt, content.rstrip(cls._SEP).strip()
+
+        return None, text
+
+    # ── 开头匹配 handlers（即原有逻辑）────────────────────
+
+    @classmethod
+    def _parse_ymd(cls, t, today):
+        m = re.match(r'^(\d{4})\s*[年]\s*(\d{1,2})\s*[月]\s*(\d{1,2})\s*[日号]?\s*', t)
+        if m:
+            return date(int(m[1]), int(m[2]), int(m[3])), t[m.end():]
+
+    @classmethod
+    def _parse_iso_date(cls, t, today):
+        m = re.match(r'^(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s*', t)
+        if m:
+            try: return date(int(m[1]), int(m[2]), int(m[3])), t[m.end():]
+            except: return None
+
+    @classmethod
+    def _parse_compact_date(cls, t, today):
+        m = re.match(r'^(\d{4})(\d{2})(\d{2})', t)
+        if m:
+            y, mo, d = int(m[1]), int(m[2]), int(m[3])
+            if 1 <= mo <= 12 and 1 <= d <= 31:
+                try: return date(y, mo, d), t[m.end():]
+                except: return None
+
+    @classmethod
+    def _parse_today(cls, t, today):
+        m = re.match(r'^今[天日]', t)
+        if m: return today, t[m.end():]
+
+    @classmethod
+    def _parse_tomorrow(cls, t, today):
+        m = re.match(r'^明[天日]', t)
+        if m: return today + timedelta(1), t[m.end():]
+
+    @classmethod
+    def _parse_after(cls, t, today):
+        m = re.match(r'^(大?)后[天日]', t)
+        if m:
+            off = 3 if m[1] == '大' else 2
+            return today + timedelta(off), t[m.end():]
+
+    @classmethod
+    def _parse_weekday_rel(cls, t, today):
+        m = re.match(r'^((?:下下|下|这|本)?)(礼拜|星期|周)([一二三四五六日天])', t)
+        if not m: return None
+        d = cls._weekday_delta(today, m[1] or '这', cls.WEEKDAY_NAMES.get(m[3]))
+        if d is None: return None
+        return today + timedelta(d), t[m.end():]
+
+    @classmethod
+    def _parse_next_month(cls, t, today):
+        m = re.match(r'^下(?:个)?月\s*(\d{1,2})\s*[日号]?\s*', t)
+        if m: return cls._calc_next_month(today, int(m[1])), t[m.end():]
+
+    @classmethod
+    def _parse_md(cls, t, today):
+        m = re.match(r'^(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?\s*', t)
+        if not m: return None
+        d = cls._resolve_md(today, int(m[1]), int(m[2]))
+        if d: return d, t[m.end():]
+
+    @classmethod
+    def _parse_day_only(cls, t, today):
+        m = re.match(r'^(\d{1,2})\s*[日号]\s*', t)
+        if not m: return None
+        import calendar
+        day = int(m[1])
+        last = calendar.monthrange(today.year, today.month)[1]
+        if 1 <= day <= last:
+            return date(today.year, today.month, day), t[m.end():]
+
+    # ── 结尾匹配 handlers ──────────────────────────
+
+    @classmethod
+    def _end_ymd(cls, t, today):
+        """买菜2026年6月23日"""
+        m = re.search(r'(\d{4})\s*[年]\s*(\d{1,2})\s*[月]\s*(\d{1,2})\s*[日号]?\s*$', t)
+        if m:
+            return date(int(m[1]), int(m[2]), int(m[3])), t[:m.start()]
+
+    @classmethod
+    def _end_iso_date(cls, t, today):
+        """干活2026-07-04"""
+        m = re.search(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s*$', t)
+        if m:
+            try: return date(int(m[1]), int(m[2]), int(m[3])), t[:m.start()]
+            except: return None
+
+    @classmethod
+    def _end_compact_date(cls, t, today):
+        """干活20260704"""
+        m = re.search(r'(\d{4})(\d{2})(\d{2})$', t)
+        if m:
+            y, mo, d = int(m[1]), int(m[2]), int(m[3])
+            if 1 <= mo <= 12 and 1 <= d <= 31:
+                try: return date(y, mo, d), t[:m.start()]
+                except: return None
+
+    @classmethod
+    def _end_today(cls, t, today):
+        m = re.search(r'今[天日]$', t)
+        if m: return today, t[:m.start()]
+
+    @classmethod
+    def _end_tomorrow(cls, t, today):
+        m = re.search(r'明[天日]$', t)
+        if m: return today + timedelta(1), t[:m.start()]
+
+    @classmethod
+    def _end_after(cls, t, today):
+        m = re.search(r'(大?)后[天日]$', t)
+        if m:
+            off = 3 if m[1] == '大' else 2
+            return today + timedelta(off), t[:m.start()]
+
+    @classmethod
+    def _end_weekday_rel(cls, t, today):
+        m = re.search(r'((?:下下|下|这|本)?)(礼拜|星期|周)([一二三四五六日天])$', t)
+        if not m: return None
+        d = cls._weekday_delta(today, m[1] or '这', cls.WEEKDAY_NAMES.get(m[3]))
+        if d is None: return None
+        return today + timedelta(d), t[:m.start()]
+
+    @classmethod
+    def _end_next_month(cls, t, today):
+        m = re.search(r'下(?:个)?月\s*(\d{1,2})\s*[日号]?\s*$', t)
+        if m: return cls._calc_next_month(today, int(m[1])), t[:m.start()]
+
+    @classmethod
+    def _end_md(cls, t, today):
+        m = re.search(r'(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?\s*$', t)
+        if not m: return None
+        d = cls._resolve_md(today, int(m[1]), int(m[2]))
+        if d: return d, t[:m.start()]
+
+    @classmethod
+    def _end_day_only(cls, t, today):
+        m = re.search(r'(\d{1,2})\s*[日号]\s*$', t)
+        if not m: return None
+        import calendar
+        day = int(m[1])
+        last = calendar.monthrange(today.year, today.month)[1]
+        if 1 <= day <= last:
+            return date(today.year, today.month, day), t[:m.start()]
+
+    # ── 共享工具方法 ──────────────────────────
+
+    @classmethod
+    def _weekday_delta(cls, today, prefix, weekday):
+        if weekday is None: return None
+        d = weekday - today.weekday()
+        if prefix in ('这', '本'):
+            return d + 7 if d <= 0 else d
+        if prefix == '下': return d + 7
+        if prefix == '下下': return d + 14
+        return d
+
+    @classmethod
+    def _calc_next_month(cls, today, day):
+        import calendar
+        mo = today.month + 1
+        y = today.year
+        if mo > 12: mo, y = 1, y + 1
+        last = calendar.monthrange(y, mo)[1]
+        return date(y, mo, min(day, last))
+
+    @classmethod
+    def _resolve_md(cls, today, month, day):
+        try:
+            d = date(today.year, month, day)
+        except ValueError:
+            return None
+        if d < today:
+            try: d = date(today.year + 1, month, day)
+            except: return None
+        return d
+
+    _BEGIN_HANDLER_NAMES = [
+        '_parse_ymd', '_parse_iso_date', '_parse_compact_date',
+        '_parse_today', '_parse_tomorrow', '_parse_after',
+        '_parse_weekday_rel', '_parse_next_month', '_parse_md', '_parse_day_only',
+    ]
+
+    _END_HANDLER_NAMES = [
+        '_end_ymd', '_end_iso_date', '_end_compact_date',
+        '_end_today', '_end_tomorrow', '_end_after',
+        '_end_weekday_rel', '_end_next_month', '_end_md', '_end_day_only',
+    ]
+
+
+@register("obsidian_reminder", "quasarrise", "扫描 Obsidian 待办并定时推送提醒，集成 RSS 新闻简报", "1.2.0")
 class ObsidianReminder(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -83,8 +376,26 @@ class ObsidianReminder(Star):
 
         # --- 插件配置（来自 WebUI）---
         self.vault_path = cfg.get("vault_path") or ""
-        self.config_dir = "/AstrBot/data"
-        self.config_file = f"{self.config_dir}/obsidian_config.json"
+        data_dir = get_astrbot_data_path()
+        self.config_dir = os.path.join(data_dir, "config")
+        self.config_file = os.path.join(self.config_dir, "obsidian_reminder_config.json")
+        self.task_file_template = cfg.get("task_file") or "{{date}}.md"
+        self.task_format = cfg.get("task_format") or "emoji"
+        self.task_mode = cfg.get("task_mode") or "daily"
+        # 任务文档列表
+        self.task_docs = []
+        raw_docs = cfg.get("task_docs", [])
+        if raw_docs:
+            for item in raw_docs[:4]:
+                path = (item.get("path") or "").strip()
+                trigger = (item.get("trigger") or "").strip()
+                if path:
+                    # 触发词默认用文件名（不含路径和后缀）
+                    _stem = os.path.splitext(os.path.basename(path))[0]
+                    self.task_docs.append({
+                        "path": path,
+                        "trigger": trigger or _stem,
+                    })
 
         # 任务推送时间（空字符串 = 不推送）
         m_h, m_m = _parse_time(cfg.get("morning_push_time") or "")
@@ -100,17 +411,37 @@ class ObsidianReminder(Star):
         nm_h, nm_m = _parse_time(cfg.get("morning_news_time") or "")
         ne_h, ne_m = _parse_time(cfg.get("night_news_time") or "")
 
-        # 新闻源（总是保存，新闻启用时才用）
-        raw_sources = cfg.get("news_sources", [])
-        self.news_sources = {}
-        if raw_sources:
-            for item in raw_sources:
-                name = (item.get("name") or "").strip()
-                url = (item.get("url") or "").strip()
-                if name and url:
-                    self.news_sources[name] = url
+        # 新闻分组（最多3组，每组可选 llm / raw 模式）
+        raw_groups = cfg.get("news_groups", [])
+        self.news_groups = []
+        if raw_groups:
+            for g in raw_groups[:3]:
+                name = (g.get("name") or "").strip()
+                mode = (g.get("mode") or "llm").strip()
+                sources = {}
+                raw_text = (g.get("sources_text") or "").strip()
+                for line in raw_text.split('\n'):
+                    line = line.strip()
+                    if '|' not in line or line.startswith('#'):
+                        continue
+                    parts = line.split('|', 1)
+                    sname = parts[0].strip()
+                    surl = parts[1].strip()
+                    if sname and surl:
+                        sources[sname] = surl
+                if name and sources:
+                    self.news_groups.append({
+                        "name": name,
+                        "mode": mode,
+                        "sources": sources,
+                    })
+                    logging.info(f"[NewsScout] 加载分组「{name}」({mode}, {len(sources)}个源)")
 
-        # --- Bot 绑定配置（!obreg 管理）---
+        # --- LLM 提示词模板（WebUI 可配置，空则用内置默认） ---
+        self.news_prompt = (cfg.get("news_prompt") or "").strip() or DEFAULT_NEWS_PROMPT
+        self.review_prompt = (cfg.get("review_prompt") or "").strip() or DEFAULT_REVIEW_PROMPT
+
+        # --- Bot 绑定配置（!obreg 管理） ---
         self.config_data = {} 
         if os.path.exists(self.config_file):
             with open(self.config_file, 'r') as f:
@@ -138,7 +469,7 @@ class ObsidianReminder(Star):
             if ne_h or ne_m:
                 self.scheduler.add_job(self.news_scout_task, 'cron', hour=ne_h, minute=ne_m)
         self.scheduler.start()
-        logging.info("--- [Obsidian Task Reminder] v1.0.0 已启动 ---")
+        logging.info("--- [Obsidian Task Reminder] v1.2.0 已启动 ---")
 
     def _load_config(self):
         if os.path.exists(self.config_file):
@@ -159,14 +490,14 @@ class ObsidianReminder(Star):
         # 2. 语气生成器 (真人伙伴风格)
         def get_greeting(t_count, o_count, p_mode):
             if p_mode == 'manual':
-                if t_count + o_count == 0: return "今天暂时没啥要紧事，玩去吧。"
-                greetings = ["看下当前的进度：", "今天还有这些事：", "今天的活儿：", "OK，这是还没处理的："]
+                if t_count + o_count == 0: return "🎉 今天暂时没啥要紧事，玩去吧。"
+                greetings = ["📋 看下当前的进度：", "📋 今天还有这些事：", "📋 今天的活儿：", "📋 还没处理的："]
             elif p_mode == 'morning':
-                greetings = ["早啊！今天的活儿：", "咱们先把这几个搞定：", "起来了吗？今天得接着忙活这些："]
+                greetings = ["🌅 早啊！今天的活儿：", "🌅 咱们先把这几个搞定：", "🌅 起来了吗？今天得接着忙活这些："]
             elif p_mode == 'night':
-                return "今天怎么样？顺便看一眼明天还有啥事："
+                return "🌙 今天怎么样？顺便看一眼明天还有啥事："
             else:
-                greetings = ["进度提醒：", "这些还没勾掉："]
+                greetings = ["⏳ 进度提醒：", "⏳ 这些还没勾掉："]
             return random.choice(greetings)
         # 3. 合并与排序 (逻辑同 6.2)
         all_tasks = []
@@ -178,25 +509,23 @@ class ObsidianReminder(Star):
             all_tasks.append(t)
         all_tasks.sort(key=lambda x: (x['is_today'], self.priority_map.get(x['priority'], 2)), reverse=True)
         # 4. 构造消息体
+        priority_emoji = {"highest": "🔺", "high": "⏫", "medium": "🔼", "normal": "🔵", "low": "🔽", "lowest": "⏬"}
         report_lines = [get_greeting(len(today_tasks), len(overdue_tasks), mode)]
         if all_tasks:
             for t in all_tasks:
-             # prefix = "[今]" if t['is_today'] else "[延]"
-                suffix = "" if t['is_today'] else f" ({t['date']})"
-                # 优先级特别高的任务加个加粗
-                p_label = f"**{t['priority'].upper()}**" if self.priority_map.get(t['priority']) >= 4 else t['priority'].upper()
-                # report_lines.append(f"[{t['priority'].upper()}] {t['text']}{suffix}")
-                report_lines.append(f"[{p_label}]{t['project']}:{t['text']}{suffix}")
+                pe = priority_emoji.get(t['priority'], "⚪")
+                pfx = "" if t['is_today'] else f" ⏰{t['date']}"
+                report_lines.append(f"{pe} {t['project']}:{t['text']}{pfx}")
         # 5. 明日预告逻辑 (保持精简)
         if mode == 'night':
             tomorrow_str = (today_date + timedelta(days=1)).strftime("%Y-%m-%d")
             tomorrow_tasks = self.scan_tasks(tomorrow_str)
             imp_tomorrow = [t for t in tomorrow_tasks if self.priority_map.get(t['priority'], 2) >= 4]
             if imp_tomorrow:
-                report_lines.append("\n明天有这些事：")
+                report_lines.append("\n📆 明天的事：")
                 for t in imp_tomorrow:
-                    report_lines.append(f"• {t['text']}")
-        chain = MessageChain().message("\n".join(report_lines))
+                    report_lines.append(f"🟠 {t['project']}:{t['text']}")
+        chain = MessageChain().message("\r\n".join(report_lines))
         await self.send_to_authorized_bots(chain)
 
     def scan_tasks(self, date_str):
@@ -286,13 +615,46 @@ class ObsidianReminder(Star):
             # logging.debug(f"拒绝访问: {curr_session} 试图访问 Bot {current_bot_id}")
             return
 
-        # 2. 自然语言手动查询
-        # 1) 核心意图词（没有这些词，大概率不是在查任务）
+        # 2. 添加任务 !obadd <自然语言>
+        if msg.startswith("!obadd"):
+            event.stop_event()
+            raw = event.message_str.strip()[len("!obadd"):].strip()
+            if not raw:
+                await self.context.send_message(curr_session, MessageChain().message(
+                    "用法示例：\n"
+                    "!obadd 明天修手表\n"
+                    "!obadd 2026年6月23日买菜\n"
+                    "!obadd 下周二看病"
+                ))
+                return
+            await self._add_task(curr_session, raw)
+            return
+
+        # 3. 自然语言添加任务：加个任务 / 加个待办 / 加任务 / 加待办
+        _add_keywords = ["加个任务", "加个待办", "加任务", "加待办"]
+        for _pat in _add_keywords:
+            _idx = msg.find(_pat)
+            if 0 <= _idx <= 1:
+                event.stop_event()
+                _add_raw = event.message_str.strip()[_idx + len(_pat):]
+                if _add_raw and _add_raw[0] in ' ，,、：:;；\t':
+                    _add_raw = _add_raw[1:]
+                _add_raw = _add_raw.strip()
+                if _add_raw:
+                    await self._add_task(curr_session, _add_raw)
+                else:
+                    await self.context.send_message(curr_session, MessageChain().message(
+                        "用法示例：\n加个任务明天修手表\n加个待办买菜\n加任务下周二看病"
+                    ))
+                return
+
+        # 4. 自然语言手动查询
         core_tasks = ["任务", "待办", "todo", "事项", "安排", "要办","要忙的","有什么事","有啥事"]
         # 2) 辅助询问词
         query_words = ["今天", "今日", "什么", "有哪些", "查下", "看下", "查"]
         # 3) 排除词黑名单（防止误伤你的日期计算或天气询问）
-        negative_words = ["天气", "为什么", "计算", "到底", "可能", "原因", "认为", "分析"]
+        negative_words = ["天气", "为什么", "计算", "到底", "可能", "原因", "认为", "分析",
+                           "加个任务", "加个待办", "加任务", "加待办"]
         # 逻辑判断：
         # 条件 A: 包含核心词（如：任务、待办）
         has_core = any(c in msg for c in core_tasks)
@@ -301,7 +663,7 @@ class ObsidianReminder(Star):
         # 条件 C: 排除黑名单
         not_negative = not any(n in msg for n in negative_words)
         # 最终组合：(有核心词 OR 是超短查询) AND 不在黑名单内
-        is_query = (has_core or is_short_cmd) and not_negative
+        is_query = has_core and (any(q in msg for q in query_words)) and not_negative
         
         # 3. 命中查询意图，直接调用封装好的推送函数
         if is_query:
@@ -325,7 +687,7 @@ class ObsidianReminder(Star):
             umo = event.unified_msg_origin
             provider_id = await self.context.get_current_chat_provider_id(umo=umo)
             context_str = "\n".join([f"- 项目:[{t['project']}] 任务:{t['text']} 标签:{'/'.join(t['tags'])}" for t in all_tasks])
-            prompt = f"你是一个专业的合作伙伴和靠谱的朋友。请分析以下本周未完成的任务：\n{context_str}\n 请以你的人格设定，结合项目名和标签，给出一个简短的进度压力分析和下周建议。不要列清单，直接给结论。限 100 字。"
+            prompt = _render_template(self.review_prompt, context=context_str)
             llm_resp = await self.context.llm_generate(chat_provider_id=provider_id, prompt=prompt)
             if llm_resp:
                 await self.context.send_message(curr_session, MessageChain().message(f"📊 **实时一周复盘**\n\n{llm_resp.completion_text}"))
@@ -380,15 +742,12 @@ class ObsidianReminder(Star):
             if not providers: return
             provider_id = providers[0].id # 使用第一个可用的模型
 
-            # 3. 构造素材和 Prompt (复用之前的逻辑)
+            # 3. 构造素材和 Prompt (复用之前的逻辑，模板可配置)
             context_str = "\n".join([
                 f"- 项目:[{t['project']}] 任务:{t['text']} 标签:{'/'.join(t['tags'])}"
                 for t in all_tasks
             ])
-            prompt = (
-                f"你是一个专业的合作伙伴和靠谱的朋友。请分析以下本周未完成的任务：\n{context_str}\n"
-                "请以你的人格设定，结合项目名和标签，给出一个简短的进度压力分析和下周建议。不要列清单，直接给结论。限 100 字。"
-            )
+            prompt = _render_template(self.review_prompt, context=context_str)
 
             # 4. 调用 AI
             llm_resp = await self.context.llm_generate(
@@ -404,60 +763,6 @@ class ObsidianReminder(Star):
             logging.error(f"[Obsidian Reminder] LLM 调用失败: {e}")
             return "（AI复盘暂时不可用，但看清单你这周挺忙的，注意休息吧！）"
 
-    async def send_humanized_report(self, target_umo, raw_report):
-        # 1. 自动生成标题
-        now = datetime.now().hour
-        title = "🌅 早间资讯汇总" if 5 <= now < 12 else "🌙 晚间资讯汇总"
-        if 12 <= now < 18: title = "☕ 午后情报摘要"
-
-        # 2. 预处理：先清洗 Markdown 还是后清洗？
-        # 我们先清洗，这样字数统计才是最准确的（去掉 ** 等占位符）
-        clean_full_text = self.clean_markdown(raw_report)
-        final_paragraphs = [title] # 第一段永远是标题
-        current_chunk = ""
-        
-        # 3. 逻辑分段：按行处理，精准控制字数
-        lines = clean_full_text.split('\n')
-        for line in lines:
-            stripped_line = line.strip()
-            # --- 强制分段条件判定 ---
-            # 条件 A: 遇到了真正的空行 (连续换行)
-            is_empty_line = not stripped_line 
-            # 条件 B: 遇到了标题行 (以 ## 开头)
-            is_new_topic = stripped_line.startswith('##')
-            # 条件 C: 当前累积的内容已经足够长了 (100字换行 / 150字句尾)
-            is_too_long = len(current_chunk) > 100
-            is_critical_long = len(current_chunk) > 150 and any(p in current_chunk[-5:] for p in "。！？")
-            if (is_empty_line or is_new_topic or is_too_long or is_critical_long) and current_chunk.strip():
-                final_paragraphs.append(current_chunk.strip())
-                current_chunk = ""
-                # 如果是标题行，直接开始新的一块
-                if is_new_topic:
-                    current_chunk = stripped_line + "\n"
-                continue
-            if stripped_line:
-                current_chunk += stripped_line + "\n"
-        # 补漏：添加最后剩余的内容
-        if current_chunk.strip():
-            final_paragraphs.append(current_chunk.strip())
-            
-        # 4. 发送逻辑 (带随机延迟)
-        logging.info(f"[NewsScout] 最终分段统计: {len(final_paragraphs)} 段")
-        for i, para in enumerate(final_paragraphs):
-            # 随机延迟策略
-            # 第一段(标题)前摇久一点；短段落快发，长段落慢发
-            if i == 0:
-                delay = random.uniform(5.0, 8.0)
-            else:
-                # 基础 2.5 秒 + 每 10 个字增加 0.5 秒延迟，封顶 8 秒
-                delay = 2.5 + min(len(para) / 10 * 0.5, 5.5)
-                delay += random.uniform(0, 2.0) # 加入微小波动
-            await asyncio.sleep(delay)
-            # 执行发送
-            chain = MessageChain().message(para)
-            await self.send_to_authorized_bots(chain, only_to_umo=target_umo)
-            logging.info(f"[NewsScout] 段落 {i+1} 已推送 ({len(para)}字)")
-
     def clean_markdown(self, text):
         """移除 Markdown 符号"""
         import re
@@ -466,33 +771,197 @@ class ObsidianReminder(Star):
         return text.strip()
             
     async def news_scout_task(self, target_umo=None):
-        """核心情报处理函数：由定时器或 !news 指令触发"""
-        if not self.config_data: 
+        """核心情报处理：遍历所有新闻分组，按各组模式分别处理推送"""
+        if not self.config_data:
             logging.error("[NewsScout] 尚未绑定 UMO，请先发送 !obreg")
             return
-        
-        try:
-            # 1. 获取 LLM 模型
-            # 必须传入 umo 参数，这样 AstrBot 才知道该会话当前关联的是哪个模型
-            query_umo = target_umo if target_umo else next(iter(self.config_data.values()), None)
-            if not query_umo:
-                logging.error("[NewsScout] 配置库为空，无法获取 UMO 以查询 Provider")
-                return
-            p_id = await self.context.get_current_chat_provider_id(umo=query_umo)
-            if not p_id:
-                logging.error(f"[NewsScout] 无法为 UMO {query_umo} 获取到 Provider ID。请确保该账号已在 AstrBot 中配置模型。")
-                return
-            
-            # 2. 实例化 NewsScout 并抓取提炼
-            scout = NewsScout(sources=self.news_sources if self.news_sources else None)
-            report = await scout.get_curated_report(self.context, p_id)
-            if report:
-                await self.send_humanized_report(target_umo, report) 
+        if not self.news_groups:
+            if target_umo:
+                await self.context.send_message(target_umo, MessageChain().message("⚠️ 未配置新闻分组，请先在 WebUI 设置新闻源。"))
+            return
+
+        query_umo = target_umo if target_umo else next(iter(self.config_data.values()), None)
+        if not query_umo:
+            logging.error("[NewsScout] 配置库为空，无法获取 UMO 以查询 Provider")
+            return
+        p_id = await self.context.get_current_chat_provider_id(umo=query_umo)
+        if not p_id:
+            logging.error(f"[NewsScout] 无法为 UMO {query_umo} 获取到 Provider ID")
+            return
+
+        now_hour = datetime.now().hour
+        time_label = "🌅 早间" if 5 <= now_hour < 12 else ("🌙 晚间" if now_hour >= 18 else "☕ 午后")
+
+        for idx, group in enumerate(self.news_groups):
+            group_name = group["name"]
+            group_mode = group["mode"]
+            sources = group["sources"]
+
+            logging.info(f"[NewsScout] 处理分组 [{idx+1}/{len(self.news_groups)}]「{group_name}」({group_mode})")
+
+            try:
+                report = await NewsScout.process_group(
+                    name=group_name, sources=sources,
+                    mode=group_mode, context=self.context,
+                    provider_id=p_id if group_mode == "llm" else None,
+                    prompt_template=self.news_prompt if group_mode == "llm" else None,
+                )
+            except Exception as e:
+                logging.error(f"[NewsScout] 分组「{group_name}」处理异常: {e}")
+                continue
+
+            if not report:
+                logging.warning(f"[NewsScout] 分组「{group_name}」未产生报告")
+                if idx == 0 and target_umo:
+                    await self.context.send_message(
+                        target_umo,
+                        MessageChain().message(f"⚠️「{group_name}」暂无内容。可能是源站网络波动。"),
+                    )
+                continue
+
+            # 在分组之间添加分隔延迟
+            if idx > 0:
+                await asyncio.sleep(random.uniform(3.0, 5.0))
+
+            if group_mode == "llm":
+                await self._send_llm_report(target_umo, report, time_label)
             else:
-                # 至少给个回音
-                await self.context.send_message(target_umo, MessageChain().message("⚠️ 抓取失败或今日无新闻更新。"))
-                
+                await self._send_raw_report(target_umo, report, time_label)
+
+    async def _send_llm_report(self, target_umo, raw_report, time_label):
+        """发送 LLM 提炼报告（带智能分段+随机延迟）"""
+        # 1. 构建标题
+        title = f"{time_label}资讯汇总"
+
+        # 2. 预处理：清洗 Markdown 后分段
+        clean_full = self.clean_markdown(raw_report)
+        final_paragraphs = [title]
+        current_chunk = ""
+        lines = clean_full.split('\n')
+        for line in lines:
+            stripped_line = line.strip()
+            is_empty_line = not stripped_line
+            is_new_topic = stripped_line.startswith('##')
+            is_too_long = len(current_chunk) > 100
+            is_critical_long = len(current_chunk) > 150 and any(p in current_chunk[-5:] for p in "。！？")
+            if (is_empty_line or is_new_topic or is_too_long or is_critical_long) and current_chunk.strip():
+                final_paragraphs.append(current_chunk.strip())
+                current_chunk = ""
+                if is_new_topic:
+                    current_chunk = stripped_line + "\n"
+                continue
+            if stripped_line:
+                current_chunk += stripped_line + "\n"
+        if current_chunk.strip():
+            final_paragraphs.append(current_chunk.strip())
+
+        # 3. 发送（带随机延迟）
+        logging.info(f"[NewsScout] LLM 报告分段: {len(final_paragraphs)} 段")
+        for i, para in enumerate(final_paragraphs):
+            if i == 0:
+                delay = random.uniform(5.0, 8.0)
+            else:
+                delay = 2.5 + min(len(para) / 10 * 0.5, 5.5)
+                delay += random.uniform(0, 2.0)
+            await asyncio.sleep(delay)
+            chain = MessageChain().message(para)
+            await self.send_to_authorized_bots(chain, only_to_umo=target_umo)
+            logging.info(f"[NewsScout] 段落 {i+1} 已推送 ({len(para)}字)")
+
+    async def _send_raw_report(self, target_umo, raw_report, time_label):
+        """发送原文链接报告（直接推送，不分段）"""
+        final = f"{time_label}速览\n\n{raw_report}"
+        logging.info(f"[NewsScout] 原文报告: {len(final)} 字")
+        await asyncio.sleep(random.uniform(2.0, 4.0))
+        chain = MessageChain().message(final)
+        await self.send_to_authorized_bots(chain, only_to_umo=target_umo)
+        logging.info("[NewsScout] 原文报告已推送")
+
+    async def _add_task(self, session, raw_text):
+        """解析文本并写入 Obsidian 任务。被 !obadd 和自然语言触发共用。"""
+        if not self.vault_path:
+            await self.context.send_message(session, MessageChain().message(
+                "❌ 请先在 WebUI 配置页面设置「Obsidian 笔记库路径」"
+            ))
+            return
+        # 提取文档指定符 [xxx] 并清洗文本
+        clean_text, doc_path = self._extract_doc_spec(raw_text)
+        if len(clean_text) <= 1:
+            await self.context.send_message(session, MessageChain().message(
+                "❌ 没识别到任务内容，例：!obadd 明天修手表"
+            ))
+            return
+        task_date, task_text = ChineseDateParser.parse(clean_text)
+        if not task_text:
+            await self.context.send_message(session, MessageChain().message(
+                "❌ 没识别到任务内容，例：!obadd 明天修手表"
+            ))
+            return
+        try:
+            if self.task_format == "dataview":
+                if task_date:
+                    line = f"- [ ] #task {task_text}  [due:: {task_date.isoformat()}]"
+                    date_hint = f"📅 {task_date.isoformat()}"
+                else:
+                    line = f"- [ ] #task {task_text}"
+                    date_hint = "📅 未指定日期"
+            else:
+                if task_date:
+                    line = f"- [ ] #task {task_text} 📅 {task_date.isoformat()}"
+                    date_hint = f"📅 {task_date.isoformat()}"
+                else:
+                    line = f"- [ ] #task {task_text}"
+                    date_hint = "📅 未指定日期"
+            # 确定文件路径
+            if self.task_mode == "docs":
+                if doc_path:
+                    file_path = os.path.join(self.vault_path, doc_path)
+                elif self.task_docs:
+                    file_path = os.path.join(self.vault_path, self.task_docs[0]["path"])
+                else:
+                    file_path = self._resolve_task_file(task_date)
+            else:
+                file_path = self._resolve_task_file(task_date)
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            # 如果文件存在且不以换行结尾，先补一个换行再追加
+            if os.path.exists(file_path):
+                with open(file_path, 'rb') as f:
+                    f.seek(0, 2)  # 跳到末尾
+                    if f.tell() > 0:
+                        f.seek(-1, 2)
+                        if f.read(1) != b'\n':
+                            with open(file_path, 'a', encoding='utf-8') as f2:
+                                f2.write('\n')
+            with open(file_path, 'a', encoding='utf-8') as f:
+                f.write(line + "\n")
+            await self.context.send_message(session, MessageChain().message(
+                f"✅ 已添加任务\n📁 {os.path.relpath(file_path, self.vault_path)}\n"
+                f"{date_hint}\n{line}"
+            ))
         except Exception as e:
-            logging.error(f"[NewsScout] 任务失败: {e}")
-            if target_umo: # 仅在主动查询时回传错误
-                await self.context.send_message(target_umo, MessageChain().message(f"❌ 运行出错: {str(e)}"))
+            logging.error(f"[_add_task] 写入失败: {e}")
+            await self.context.send_message(session, MessageChain().message(
+                f"❌ 写入失败: {e}"
+            ))
+
+    def _extract_doc_spec(self, raw_text):
+        """从文本末尾提取 [文档指定符]，返回 (清洗后文本, 匹配的path或None)。"""
+        text = raw_text.strip()
+        if self.task_mode != "docs" or not self.task_docs:
+            return text, None
+        m = re.search(r'\[([^\]]+)\]$', text)
+        if not m:
+            return text, None
+        spec = m.group(1).strip()
+        # 按触发词匹配（未设置触发词时自动用文件名代替）
+        for doc in self.task_docs:
+            if spec == doc["trigger"]:
+                return text[:m.start()].strip(), doc["path"]
+        return text, None
+
+    def _resolve_task_file(self, task_date):
+        """根据 task_file 模板和日期解析出完整路径。task_date 为 None 时使用今天。"""
+        from datetime import date
+        d = task_date if task_date else date.today()
+        relative = self.task_file_template.replace("{{date}}", d.isoformat())
+        return os.path.join(self.vault_path, relative)
