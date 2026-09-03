@@ -11,15 +11,13 @@ DEFAULT_NEWS_PROMPT = (
     "你是一位冷静、高效的资深编辑。请完成以下任务：\n"
     "1. 语义去重与新闻整合：合并不同来源对同一大事的报道，英文内容直接翻译要点（这部分无须反馈给我）。\n"
     "2. 要闻精选与内容提炼：基于结尾列出的素材，选出 5 条对中国市场、全球政治或全球科技有重大影响的消息，"
-    "每条用一句话补充要点并说明它为何重要（不超过100字），注明新闻来源。\n"
-    "\n素材如下："
+    "每条用一句话补充要点并说明它为何重要（不超过100字），注明新闻来源。"
 )
 
 DEFAULT_REVIEW_PROMPT = (
     "你是一个专业的合作伙伴和靠谱的朋友。请基于结尾列出的本周未完成任务清单，"
     "以你的人格设定，结合项目名和标签，给出简短的进度压力分析和下周建议。"
-    "不要列清单，直接给结论。限 100 字。\n"
-    "\n本周未完成任务清单："
+    "不要列清单，直接给结论。限 100 字。"
 )
 
 
@@ -77,7 +75,7 @@ class NewsScout:
             return None
 
         tmpl = prompt_template or DEFAULT_NEWS_PROMPT
-        prompt = tmpl.rstrip("\n") + "\n" + chr(10).join(raw_lines)
+        prompt = tmpl.rstrip("\n") + "\n\n素材如下：\n" + chr(10).join(raw_lines)
         resp = await context.llm_generate(chat_provider_id=provider_id, prompt=prompt)
         return resp.completion_text if resp else None
 
@@ -680,7 +678,7 @@ class ObsidianReminder(Star):
             umo = event.unified_msg_origin
             provider_id = await self.context.get_current_chat_provider_id(umo=umo)
             context_str = "\n".join([f"- 项目:[{t['project']}] 任务:{t['text']} 标签:{'/'.join(t['tags'])}" for t in all_tasks])
-            prompt = self.review_prompt.rstrip("\n") + "\n" + context_str
+            prompt = self.review_prompt.rstrip("\n") + "\n\n本周未完成任务清单：\n" + context_str
             llm_resp = await self.context.llm_generate(chat_provider_id=provider_id, prompt=prompt)
             if llm_resp:
                 await self.context.send_message(curr_session, MessageChain().message(f"📊 **实时一周复盘**\n\n{llm_resp.completion_text}"))
@@ -740,7 +738,7 @@ class ObsidianReminder(Star):
                 f"- 项目:[{t['project']}] 任务:{t['text']} 标签:{'/'.join(t['tags'])}"
                 for t in all_tasks
             ])
-            prompt = self.review_prompt.rstrip("\n") + "\n" + context_str
+            prompt = self.review_prompt.rstrip("\n") + "\n\n本周未完成任务清单：\n" + context_str
 
             # 4. 调用 AI
             llm_resp = await self.context.llm_generate(
