@@ -606,7 +606,7 @@ class ObsidianReminder(Star):
             # logging.debug(f"拒绝访问: {curr_session} 试图访问 Bot {current_bot_id}")
             return
 
-        # 2. 添加任务 !obadd <自然语言>
+        # 2. 添加任务 !obadd <任务信息>
         if msg.startswith("!obadd"):
             event.stop_event()
             raw = event.message_str.strip()[len("!obadd"):].strip()
@@ -640,9 +640,9 @@ class ObsidianReminder(Star):
                 return
 
         # 4. 自然语言手动查询
-        core_tasks = ["任务", "待办", "todo", "事项", "安排", "要办","要忙的","有什么事","有啥事"]
+        core_tasks = ["任务", "待办", "todo", "事要办" , "要忙的" , "有啥事"]
         # 2) 辅助询问词
-        query_words = ["今天", "今日", "什么", "有哪些", "查下", "看下", "查"]
+        query_words = ["今天", "今日", "有什么", "有哪些", "查下", "看下", "查"]
         # 3) 排除词黑名单（防止误伤你的日期计算或天气询问）
         negative_words = ["天气", "为什么", "计算", "到底", "可能", "原因", "认为", "分析",
                            "加个任务", "加个待办", "加任务", "加待办"]
@@ -727,11 +727,15 @@ class ObsidianReminder(Star):
             return #（如果没任务就不打扰了） "这周任务全清了，你小子可以啊！"
 
         try:
-            # 2. 获取 Provider ID
-            # 在没有 event 的情况下，我们直接获取插件上下文绑定的默认模型 ID
-            providers = await self.context.get_all_providers()
-            if not providers: return
-            provider_id = providers[0].id # 使用第一个可用的模型
+            # 2. 获取 Provider ID：用绑定 UMO 的当前会话 provider（与手动复盘/新闻一致）
+            query_umo = next(iter(self.config_data.values()), None)
+            if not query_umo:
+                logging.error("[Obsidian Reminder] 配置库为空，无法获取 UMO 以查询 Provider")
+                return
+            provider_id = await self.context.get_current_chat_provider_id(umo=query_umo)
+            if not provider_id:
+                logging.error(f"[Obsidian Reminder] 无法为 UMO {query_umo} 获取到 Provider ID")
+                return
 
             # 3. 构造素材和 Prompt (复用之前的逻辑，模板可配置)
             context_str = "\n".join([
@@ -875,8 +879,15 @@ class ObsidianReminder(Star):
                 "❌ 请先在 WebUI 配置页面设置「Obsidian 笔记库路径」"
             ))
             return
+        # docs 模式必须配置目标文档，否则拒绝添加（避免静默退回 task_file）
+        if self.task_mode == "docs" and not self.task_docs:
+            await self.context.send_message(session, MessageChain().message(
+                "❌ 当前任务写入模式为 docs，但未配置任何目标文档。\n"
+                "请先在 WebUI 插件设置中配置「任务写入目标文档」列表（至少一个），再添加任务。"
+            ))
+            return
         # 提取文档指定符 [xxx] 并清洗文本
-        clean_text, doc_path = self._extract_doc_spec(raw_text)
+        clean_text, doc_path, unmatched_spec = self._extract_doc_spec(raw_text)
         if len(clean_text) <= 1:
             await self.context.send_message(session, MessageChain().message(
                 "❌ 没识别到任务内容，例：!obadd 明天修手表"
@@ -928,6 +939,11 @@ class ObsidianReminder(Star):
             await self.context.send_message(session, MessageChain().message(
                 f"✅ 已添加任务\n📁 {os.path.relpath(file_path, self.vault_path)}\n"
                 f"{date_hint}\n{line}"
+                + (
+                    f"\n\n⚠️ 触发词「{unmatched_spec}」未匹配到任何已配置文档，已计入上方的默认文档。\n"
+                    f"可用的触发词：{'、'.join(d['trigger'] for d in self.task_docs)}"
+                    if unmatched_spec else ""
+                )
             ))
         except Exception as e:
             logging.error(f"[_add_task] 写入失败: {e}")
@@ -936,19 +952,21 @@ class ObsidianReminder(Star):
             ))
 
     def _extract_doc_spec(self, raw_text):
-        """从文本末尾提取 [文档指定符]，返回 (清洗后文本, 匹配的path或None)。"""
+        """从文本末尾提取 [文档指定符]。返回 (清洗后文本, 匹配的path或None, 未匹配的触发词或None)。
+        未匹配时不清洗方括号（保留信息），但标记出未匹配的触发词供 _add_task 反馈。"""
         text = raw_text.strip()
         if self.task_mode != "docs" or not self.task_docs:
-            return text, None
+            return text, None, None
         m = re.search(r'\[([^\]]+)\]$', text)
         if not m:
-            return text, None
+            return text, None, None
         spec = m.group(1).strip()
         # 按触发词匹配（未设置触发词时自动用文件名代替）
         for doc in self.task_docs:
             if spec == doc["trigger"]:
-                return text[:m.start()].strip(), doc["path"]
-        return text, None
+                return text[:m.start()].strip(), doc["path"], None
+        # 有方括号触发词但未匹配任何已配置文档：不清洗方括号，path=None，标记触发词未匹配
+        return text, None, spec
 
     def _resolve_task_file(self, task_date):
         """根据 task_file 模板和日期解析出完整路径。task_date 为 None 时使用今天。"""

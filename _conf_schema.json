@@ -1,7 +1,7 @@
 {
   "vault_path": {
     "description": "Obsidian 笔记库路径（任务功能总开关）",
-    "hint": "留空则关闭全部任务扫描与推送功能",
+    "hint": "填写**任务文档所在目录**的完整路径，留空则关闭全部任务功能",
     "type": "string"
   },
   "morning_push_time": {
@@ -21,7 +21,7 @@
   },
   "review_day": {
     "description": "周复盘日",
-    "hint": "需同时设置时间。mon/tue/wed/thu/fri/sat/sun",
+    "hint": "留空则不推送。需同时设置时间：mon/tue/wed/thu/fri/sat/sun",
     "type": "string"
   },
   "review_time": {
@@ -29,15 +29,8 @@
     "hint": "需同时设置复盘日。格式 HH:MM，如 22:00",
     "type": "string"
   },
-  "news_prompt": {
-    "description": "新闻 LLM 提炼提示词模板",
-    "hint": "纯指令。结尾的「素材如下：」和新闻素材由插件自动拼接，无需自行添加。留空使用内置默认。",
-    "type": "text",
-    "default": "你是一位冷静、高效的资深编辑。请完成以下任务：\n1. 语义去重与新闻整合：合并不同来源对同一大事的报道，英文内容直接翻译要点（这部分无须反馈给我）。\n2. 要闻精选与内容提炼：基于结尾列出的素材，选出 5 条对中国市场、全球政治或全球科技有重大影响的消息，每条用一句话补充要点并说明它为何重要（不超过100字），注明新闻来源。"
-  },
   "review_prompt": {
-    "description": "周复盘 LLM 提示词模板",
-    "hint": "纯指令。结尾的「本周未完成任务清单：」和任务清单由插件自动拼接，无需自行添加。留空使用内置默认。",
+    "description": "周复盘 AI 提示词",
     "type": "text",
     "default": "你是一个专业的合作伙伴和靠谱的朋友。请基于结尾列出的本周未完成任务清单，以你的人格设定，结合项目名和标签，给出简短的进度压力分析和下周建议。不要列清单，直接给结论。限 100 字。"
   },
@@ -85,6 +78,12 @@
     },
     "default": []
   },
+  "news_prompt": {
+    "description": "新闻 AI 提炼提示词",
+    "hint": "仅用于llm模式，raw模式无效",
+    "type": "text",
+    "default": "你是一位冷静、高效的资讯编辑。请完成以下任务：\n1. 语义去重与新闻整合：合并不同来源对同一大事的报道，英文内容直接翻译要点（这部分无须反馈给我）。\n2. 要闻精选与内容提炼：基于结尾列出的素材，选出 5 条对中国市场、全球政治或全球科技有重大影响的消息，每条用一句话补充要点并说明它为何重要（不超过100字），注明新闻来源。"
+  },
   "task_file": {
     "description": "每日任务文档路径模板（daily 模式下有效）",
     "hint": "{{date}} 替换为日期。例: {{date}}.md → 2026-06-25.md；也可写 inbox.md",
@@ -93,20 +92,21 @@
   },
   "task_mode": {
     "description": "任务写入模式",
-    "hint": "daily: 写入 task_file 指定文档; docs: 写入下方配置的文档列表",
+    "hint": "daily: 写入 task_file 指定的每日任务文档; docs: 写入下方配置的文档列表",
     "type": "string",
     "options": ["daily", "docs"],
     "default": "daily"
   },
   "task_format": {
     "description": "任务记录格式",
-    "hint": "emoji: Tasks 插件格式; dataview: Dataview 插件格式",
+    "hint": "emoji: Tasks 插件默认格式; dataview: Dataview 兼容格式",
     "type": "string",
     "options": ["emoji", "dataview"],
     "default": "emoji"
   },
   "task_docs": {
-    "description": "任务写入目标文档（最多4个，不填则用上方 task_file 路径）",
+    "description": "任务写入目标文档（最多4个）",
+    "hint": "设置的第一个文档将成为默认文档，在添加任务时未指定目标的会自动进入该文档。",
     "type": "template_list",
     "templates": {
       "doc_entry": {
