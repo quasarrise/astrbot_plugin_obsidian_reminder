@@ -71,8 +71,8 @@ git clone git@github.com:quasarrise/astrbot_plugin_obsidian_reminder.git
 | `task_mode` | 任务写入模式：`daily` / `docs` | daily |
 | `task_format` | 任务记录格式：`emoji`(Tasks) / `dataview` | emoji |
 | `task_docs` | 任务写入目标文档列表，可配触发词 | 用 task_file 路径 |
-| `news_prompt` | 新闻 LLM 提炼提示词模板（v1.2.0） | 内建默认 |
-| `review_prompt` | 周复盘 LLM 提示词模板（v1.2.0） | 内建默认 |
+| `news_prompt` | 新闻 LLM 提炼提示词模板（v1.2.0） | 预填默认，可自定义 |
+| `review_prompt` | 周复盘 LLM 提示词模板（v1.2.0） | 预填默认，可自定义 |
 
 > **新闻分组**：`新闻分组` 下每条 `sources_text` 每行一个源，格式 `名称|网址`（`#` 开头的行忽略）。`mode` 选 `llm`（AI 提炼）或 `raw`（原文链接整理）。示例：
 
@@ -82,7 +82,7 @@ WSJ中文|https://cn.wsj.com/zh-hans/rss
 Solidot|https://www.solidot.org/index.rss
 ```
 
-> **LLM 提示词模板**（`news_prompt` / `review_prompt`）：自定义模板支持两个占位符——`{materials}` 会被替换为采集到的新闻素材、`{context}` 会被替换为本周任务清单。留空自动使用内建默认提示词；用 `.replace()` 渲染，模板里出现其他花括号不会报错。
+> **LLM 提示词模板**（`news_prompt` / `review_prompt`）：提示词是**纯指令**，无需占位符——采集到的新闻素材 / 本周任务清单会由插件**自动拼到结尾**。WebUI 输入框已预填内置默认模板（留空即用默认；也可改成你自己的指令）。建议在指令里提示模型"基于结尾列出的素材/清单"。
 
 ## 部署到 NAS（Docker）
 
@@ -99,5 +99,5 @@ ssh nas "cd ~/docker/astrbot && docker compose logs --tail=200 astrbot | grep 'O
 
 ## 版本历史
 
-- **v1.2.0**：`news_prompt` / `review_prompt` 提示词改为 WebUI 可配置（`{materials}`/`{context}` 占位符，空值回退默认）；周复盘两处重复的提示词合并为单一模板；补录自 v1.0.0 以来的功能基线。
+- **v1.2.0**：`news_prompt` / `review_prompt` 提示词改为 WebUI 可配置——纯指令模板、素材/任务清单自动拼尾、输入框预填默认（留空回退内置默认）；周复盘两处重复提示词合并；补录自 v1.0.0 以来的功能基线。
 - **v1.0.0**：基线版本（任务扫描/推送、周复盘、新闻简报、中文日期解析、任务写入）。
